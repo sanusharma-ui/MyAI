@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn==0.32.0
+groq==0.11.0
+python-dotenv==1.0.1
+redis==5.1.1  # For Upstash
+uuid==1.30    # For session IDs (if needed)
+httpx==0.27.2
