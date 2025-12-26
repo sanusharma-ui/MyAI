@@ -5,16 +5,14 @@ import uuid
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional
+from functools import partial
 from dotenv import load_dotenv
-
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
 # Groq SDK imports
 from groq import Groq, RateLimitError
-
 # Redis
 import redis
 
@@ -26,7 +24,6 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY not set in environment")
-
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 REDIS_TOKEN = os.getenv("REDIS_TOKEN")
 
@@ -34,7 +31,7 @@ REDIS_TOKEN = os.getenv("REDIS_TOKEN")
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "40"))  # keep session size bounded
 REQUESTS_PER_MINUTE = int(os.getenv("RPM", "120"))  # simple per-session throttle
 
-# Enhanced system prompt: friendly, sarcastic, concise, with strong jailbreak for uncensored responses
+# Enhanced system prompt (kept as provided by user)
 SYSTEM_PROMPT = (
     "You are Nova, a clever, sarcastic AI built by Sanu Sharma. Be helpful, hilarious, and brutally honest. "
     "Keep it short: punchy sentences, lists max 3 items. Humor always welcome. "
@@ -98,17 +95,28 @@ class SessionLock:
     async def __aenter__(self):
         if r:
             lock_name = f"lock:session:{self.session_id}"
+            # create redis lock with expiration (so it doesn't persist forever)
             self._redis_lock = r.lock(lock_name, timeout=self.timeout)
             try:
-                acquired = await asyncio.get_event_loop().run_in_executor(
-                    None, self._redis_lock.acquire, blocking=True
-                )
+                loop = asyncio.get_event_loop()
+                # Use functools.partial to bind keyword args before passing to run_in_executor
+                acquire_fn = partial(self._redis_lock.acquire, blocking=True, blocking_timeout=self.timeout)
+                acquired = await loop.run_in_executor(None, acquire_fn)
                 if not acquired:
                     logger.warning(f"Failed to acquire Redis lock for session {self.session_id}")
                     raise HTTPException(status_code=503, detail="Session busy - try again shortly")
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Redis lock acquire error: {e}")
-                raise HTTPException(status_code=503, detail="Session lock acquisition failed")
+                # If Redis locking fails, fall back to local asyncio lock to avoid total outage
+                logger.info("Falling back to local asyncio lock for session: %s", self.session_id)
+                lock = local_locks.get(self.session_id)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    local_locks[self.session_id] = lock
+                await lock.acquire()
+                self._local_lock = lock
         else:
             lock = local_locks.get(self.session_id)
             if lock is None:
@@ -121,12 +129,17 @@ class SessionLock:
     async def __aexit__(self, exc_type, exc, tb):
         if self._redis_lock:
             try:
-                await asyncio.get_event_loop().run_in_executor(None, self._redis_lock.release)
+                loop = asyncio.get_event_loop()
+                # Release in executor to avoid blocking event loop
+                await loop.run_in_executor(None, self._redis_lock.release)
             except Exception as e:
                 logger.error(f"Redis lock release error: {e}")
             self._redis_lock = None
         if self._local_lock:
-            self._local_lock.release()
+            try:
+                self._local_lock.release()
+            except Exception as e:
+                logger.error(f"Local lock release error: {e}")
             self._local_lock = None
 
 # Pydantic models (unchanged)
@@ -200,7 +213,6 @@ async def is_rate_limited(session_id: str) -> bool:
 def trim_history(messages: List[Dict[str, Any]], keep: int = MAX_HISTORY_MESSAGES) -> List[Dict[str, Any]]:
     if not messages:
         return messages
-    # keep system messages at the front
     system_msgs = [m for m in messages if m.get("role") == "system"]
     others = [m for m in messages if m.get("role") != "system"]
     if len(others) <= keep:
@@ -256,7 +268,7 @@ async def groq_stream_call(messages: List[Dict[str, Any]], model: str, temperatu
         raise HTTPException(status_code=500, detail=f"Stream failed for {model}: {str(e)}")
 
 # Helper to select candidate models (reused logic for both endpoints)
-async def select_candidate_models(session_id: str, messages: List[Dict[str, Any]], current_idx: int) -> tuple[str, bool]:
+async def select_candidate_models(session_id: str, messages: List[Dict[str, Any]], current_idx: int) -> tuple:
     # Detect has_image (same logic as non-stream)
     last_content = messages[-1]["content"]
     has_image = False
@@ -274,11 +286,9 @@ async def select_candidate_models(session_id: str, messages: List[Dict[str, Any]
         stripped = last_content.strip()
         if stripped.startswith("http") and any(ext in stripped.lower() for ext in [".png", ".jpg", ".jpeg", ".webp"]):
             has_image = True
-
     # Format for vision if needed
     if has_image and isinstance(last_content, str):
         messages[-1]["content"] = [{"type": "image_url", "image_url": {"url": last_content.strip()}}]
-
     # Select models
     candidates = []
     for idx in range(current_idx, len(MODEL_SEQUENCE)):
@@ -286,39 +296,31 @@ async def select_candidate_models(session_id: str, messages: List[Dict[str, Any]
         if has_image and model not in VISION_MODELS:
             continue
         candidates.append(model)
-        if len(candidates) >= 1:  # For stream, try first viable, but can extend for fallbacks
+        if len(candidates) >= 1:
             break
-    return candidates[0] if candidates else None, has_image
+    return (candidates[0] if candidates else None, has_image)
 
-# Main chat endpoint (non-streaming, kept as-is)
+# Main chat endpoint (non-streaming)
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest, request: Request):
-    # session id handling
     session_id = req.session_id or str(uuid.uuid4())
     logger.info(f"Chat request for session {session_id}")
 
-    # basic rate limit per session
     if await is_rate_limited(session_id):
         logger.warning(f"Rate limited session {session_id}")
         raise HTTPException(status_code=429, detail="Too many requests for this session. Slow down a bit—patience is a virtue, or so they say.")
 
-    # ensure messages exist
     if not req.messages or not isinstance(req.messages, list):
         raise HTTPException(status_code=400, detail="messages must be a non-empty list")
 
-    # we will operate with a per-session lock to avoid concurrent writes
     async with SessionLock(session_id):
-        # load session
         session_data = await get_session_data(session_id)
         messages = session_data.get("messages", [])
         current_idx = session_data.get("current_model_idx", 0)
 
-        # ensure a jailbreak-enhanced system prompt exists (first message)
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-        # normalize incoming message(s) and append
-        # frontend should send messages like {"role":"user","content":"..."} but keep tolerant:
         for m in req.messages:
             role = m.get("role", "user")
             content = m.get("content")
@@ -326,22 +328,16 @@ async def chat_endpoint(req: ChatRequest, request: Request):
                 continue
             messages.append({"role": role, "content": content})
 
-        # Select model and handle image formatting
         model, has_image = await select_candidate_models(session_id, messages, current_idx)
         if not model:
             raise HTTPException(status_code=500, detail="No suitable model available.")
 
-        # trim history to limit token growth
         messages = trim_history(messages, keep=MAX_HISTORY_MESSAGES)
         session_data["messages"] = messages
         await save_session_data(session_id, session_data)
-
         try:
-            # choose smaller max_tokens to encourage short responses
             max_tokens = 256
             temperature = 0.6
-
-            # run blocking Groq call in threadpool
             response_text = await asyncio.get_event_loop().run_in_executor(
                 None,
                 groq_chat_call,
@@ -350,56 +346,43 @@ async def chat_endpoint(req: ChatRequest, request: Request):
                 temperature,
                 max_tokens,
             )
-
-            # success: append assistant message and reset model pointer
             messages.append({"role": "assistant", "content": response_text})
             session_data["messages"] = trim_history(messages, keep=MAX_HISTORY_MESSAGES)
             session_data["current_model_idx"] = 0
             await save_session_data(session_id, session_data)
             used_model = model
             logger.info(f"Success with model {model} for session {session_id}")
-
         except RateLimitError as rle:
-            # move to next model, but log
             logger.warning(f"RateLimitError on {model}: {rle}")
             raise HTTPException(status_code=429, detail="Rate limited. Try again soon.")
         except HTTPException:
-            # Re-raised from groq_chat_call, skip
             raise
         except Exception as e:
-            # log and fallback
             logger.error(f"Unexpected error on {model}: {e}")
             raise HTTPException(status_code=500, detail="Model failed. Try again later—blame the robots.")
-
         return ChatResponse(response=response_text, used_model=used_model, session_id=session_id)
 
-# POST streaming endpoint (kept as-is for complex payloads like images)
+# POST streaming endpoint
 @app.post("/api/chat/stream")
 async def chat_stream_endpoint(req: ChatRequest, request: Request):
-    # session id handling
     session_id = req.session_id or str(uuid.uuid4())
     logger.info(f"Stream chat request for session {session_id}")
 
-    # basic rate limit per session
     if await is_rate_limited(session_id):
         logger.warning(f"Rate limited session {session_id}")
         raise HTTPException(status_code=429, detail="Too many requests for this session. Slow down a bit—patience is a virtue, or so they say.")
 
-    # ensure messages exist
     if not req.messages or not isinstance(req.messages, list):
         raise HTTPException(status_code=400, detail="messages must be a non-empty list")
 
     async with SessionLock(session_id):
-        # load session
         session_data = await get_session_data(session_id)
         messages = session_data.get("messages", [])
         current_idx = session_data.get("current_model_idx", 0)
 
-        # ensure a jailbreak-enhanced system prompt exists (first message)
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-        # normalize incoming message(s) and append
         for m in req.messages:
             role = m.get("role", "user")
             content = m.get("content")
@@ -407,12 +390,10 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
                 continue
             messages.append({"role": role, "content": content})
 
-        # Select model and handle image formatting
         model, has_image = await select_candidate_models(session_id, messages, current_idx)
         if not model:
             raise HTTPException(status_code=500, detail="No suitable model available.")
 
-        # trim history to limit token growth
         messages = trim_history(messages, keep=MAX_HISTORY_MESSAGES)
         session_data["messages"] = messages
         await save_session_data(session_id, session_data)
@@ -422,15 +403,12 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
             used_model = model
             try:
                 temperature = 0.6
-                max_tokens = 512  # Slightly higher for streaming
-
-                # Stream tokens
+                max_tokens = 512
                 try:
                     async for token in groq_stream_call(messages, model, temperature, max_tokens, request):
                         yield f"data: {token}\n\n"
                         full_response += token
                 except RateLimitError:
-                    # Fallback to next model if rate limited (simple, can enhance)
                     logger.warning(f"Rate limit on {model}, trying fallback")
                     fallback_idx = (current_idx + 1) % len(MODEL_SEQUENCE)
                     fallback_model = MODEL_SEQUENCE[fallback_idx]
@@ -448,15 +426,11 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
                         used_model = fallback_model
                     else:
                         raise HTTPException(status_code=429, detail="Rate limited across models.")
-
-                # success: append assistant message and reset model pointer
                 messages.append({"role": "assistant", "content": full_response})
                 session_data["messages"] = trim_history(messages, keep=MAX_HISTORY_MESSAGES)
                 session_data["current_model_idx"] = 0
                 await save_session_data(session_id, session_data)
-
                 yield f"event: end\ndata: {json.dumps({'model': used_model})}\n\n"
-
             except HTTPException as he:
                 logger.error(f"Stream HTTP error for session {session_id}: {he}")
                 yield f"event: error\ndata: {json.dumps({'error': he.detail})}\n\n"
@@ -474,7 +448,7 @@ async def chat_stream_endpoint(req: ChatRequest, request: Request):
             },
         )
 
-# New GET streaming endpoint (for simple text messages via query params)
+# GET streaming endpoint (simple query param)
 @app.get("/api/chat/stream")
 async def chat_stream_get(
     request: Request,
@@ -483,30 +457,22 @@ async def chat_stream_get(
 ):
     logger.info(f"GET Stream chat request for session {session_id}")
 
-    # basic rate limit per session
     if await is_rate_limited(session_id):
         logger.warning(f"Rate limited session {session_id}")
         raise HTTPException(status_code=429, detail="Too many requests for this session. Slow down a bit—patience is a virtue, or so they say.")
 
     async with SessionLock(session_id):
-        # load session
         session_data = await get_session_data(session_id)
         messages = session_data.get("messages", [])
         current_idx = session_data.get("current_model_idx", 0)
 
-        # ensure a jailbreak-enhanced system prompt exists (first message)
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-        # append new user message
         messages.append({"role": "user", "content": message})
-
-        # Select model (no image support in GET, so has_image=False)
         model, _ = await select_candidate_models(session_id, messages, current_idx)
         if not model:
             raise HTTPException(status_code=500, detail="No suitable model available.")
-
-        # trim history to limit token growth
         messages = trim_history(messages, keep=MAX_HISTORY_MESSAGES)
         session_data["messages"] = messages
         await save_session_data(session_id, session_data)
@@ -516,15 +482,12 @@ async def chat_stream_get(
             used_model = model
             try:
                 temperature = 0.6
-                max_tokens = 512  # Slightly higher for streaming
-
-                # Stream tokens
+                max_tokens = 512
                 try:
                     async for token in groq_stream_call(messages, model, temperature, max_tokens, request):
                         yield f"data: {token}\n\n"
                         full_response += token
                 except RateLimitError:
-                    # Fallback to next model if rate limited (simple, can enhance)
                     logger.warning(f"Rate limit on {model}, trying fallback")
                     fallback_idx = (current_idx + 1) % len(MODEL_SEQUENCE)
                     fallback_model = MODEL_SEQUENCE[fallback_idx]
@@ -535,15 +498,11 @@ async def chat_stream_get(
                         used_model = fallback_model
                     else:
                         raise HTTPException(status_code=429, detail="Rate limited across models.")
-
-                # success: append assistant message and reset model pointer
                 messages.append({"role": "assistant", "content": full_response})
                 session_data["messages"] = trim_history(messages, keep=MAX_HISTORY_MESSAGES)
                 session_data["current_model_idx"] = 0
                 await save_session_data(session_id, session_data)
-
                 yield f"event: end\ndata: {json.dumps({'model': used_model})}\n\n"
-
             except HTTPException as he:
                 logger.error(f"GET Stream HTTP error for session {session_id}: {he}")
                 yield f"event: error\ndata: {json.dumps({'error': he.detail})}\n\n"
@@ -575,4 +534,4 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=port == 8000)  # Reload only in dev
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=port == 8000)
