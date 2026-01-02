@@ -45,7 +45,7 @@ function App() {
   const messagesEndRef = useRef(null);
   const welcomeIntervalRef = useRef(null);
   const assistantIndexRef = useRef(null); // index of streaming assistant message
-  const backendUrl = 'http://127.0.0.1:8000';
+  const backendUrl = process.env.REACT_APP_BACKEND_URL;
   const currentAvatar = 'N';
 
   // sync messagesRef with messages state
