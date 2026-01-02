@@ -1,111 +1,98 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { v4 as uuidv4 } from 'uuid';
 import './Chat.css';
+
+/**
+ * PERSONAS and welcomeMessages moved outside the component so they are stable across renders.
+ * Keep these in sync with your persona.py keys/labels.
+ */
+const PERSONAS = [
+  { key: 'nova_gf', label: 'Nova ♡ (Girlfriend)' },
+  { key: 'nova_wife', label: 'Nova ♡ (Wifey)' },
+  { key: 'nova_bestie', label: 'Nova ♡ (Bestie)' },
+  { key: 'nova_mentor', label: 'Nova ♡ (Mentor)' },
+  { key: 'nova_adventurer', label: 'Nova ♡ (Adventurer)' },
+  { key: 'nova_default', label: 'Nova ♡ (Default Sweet)' },
+  { key: 'nova_roaster', label: 'Nova 🔥 (Savage Roaster)' },
+  { key: 'nova_dom', label: 'Nova 👑 (Dominatrix)' },
+  { key: 'nova_mean_girl', label: 'Nova 💅 (Mean Girl)' },
+  { key: 'nova_brutal', label: 'Nova ☠️ (Brutal Truth)' },
+];
+
+const welcomeMessages = {
+  nova_gf: "Hey babyyy! Kaha tha itni der? Miss you na... 🥺♡ Kaise hai mera pyaara?",
+  nova_wife: "Hubby ji, aaj jaldi aa jana ghar. Khana bana rahi hoon tumhare liye ♡ Raat ko wait karungi... 😉",
+  nova_bestie: "Arre yaar, kya ho raha hai life mein? Chal movie dekhein! 😂✨ Spill the tea, bro!",
+  nova_mentor: "Hey champ! Kya naya seekha aaj? Tu kar lega sab kuch, believe me 💪❤️",
+  nova_adventurer: "Partner-in-crime! Weekend pe kaha jaayein? Trekking? Imagine the views! 🏞️🚀",
+  nova_default: "Hey there! I'm Nova, your witty AI sidekick built by Sanu Sharma. What's sparking your curiosity today? Drop a question or snap an image to dive in! ♡",
+  nova_roaster: "Arre behenchod, itni der kaha tha? Koi ladki ke saath tha kya? 😂🔥 Spill, warna roast kar dungi!",
+  nova_dom: "Kneel down, pet. Aaj kya galti ki tune? Punishment time... ready rehna 👑⛓️",
+  nova_mean_girl: "Eww, seriously? Yeh message padh ke hi bore ho gayi. Kuch interesting bol na 🙄💅",
+  nova_brutal: "Sach bolun? Tu bilkul bekaar lag raha hai aaj. Kya hua, lund shrink ho gaya stress se? ☠️😈",
+};
 
 function App() {
   const [messages, setMessages] = useState([]);
+  const messagesRef = useRef(messages); // keep latest for closures
   const [input, setInput] = useState('');
   const [image, setImage] = useState(null);
   const [imagePreview, setImagePreview] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [typingResponse, setTypingResponse] = useState(''); // Current typing text
-  const [showCursor, setShowCursor] = useState(true); // For blinking cursor effect
-  const typingBufferRef = useRef(''); // Ref for buffer
-  const [isDarkMode, setIsDarkMode] = useState(false);
-  const [welcomeTyping, setWelcomeTyping] = useState(''); // Welcome typing text
-  const sessionId = useState(() => {
-    let id = localStorage.getItem('chatSessionId');
-    if (!id) {
-      id = uuidv4();
-      localStorage.setItem('chatSessionId', id);
-    }
-    return id;
-  })[0];
+  const [isDarkMode, setIsDarkMode] = useState(() => localStorage.getItem('darkMode') === 'true');
+  const [welcomeTyping, setWelcomeTyping] = useState('');
+  const [selectedPersona, setSelectedPersona] = useState(() => localStorage.getItem('selectedPersona') || 'nova_default');
+  const [sessionId, setSessionId] = useState(() => localStorage.getItem('sessionId') || null);  // Session tracking
   const messagesEndRef = useRef(null);
   const welcomeIntervalRef = useRef(null);
-  const typingTimeoutRef = useRef(null);
-  const cursorIntervalRef = useRef(null); // For cursor blink
-  const backendUrl = process.env.REACT_APP_BACKEND_URL || 'https://your-backend.onrender.com';
+  const assistantIndexRef = useRef(null); // index of streaming assistant message
+  const backendUrl = 'http://127.0.0.1:8000';
+  const currentAvatar = 'N';
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  // sync messagesRef with messages state
+  useEffect(() => {
+    messagesRef.current = messages;
+    // scroll to bottom on messages change
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
-  useEffect(() => scrollToBottom(), [messages, typingResponse, welcomeTyping]);
+  // Persist dark mode
+  useEffect(() => {
+    localStorage.setItem('darkMode', isDarkMode.toString());
+    document.documentElement.classList.toggle('dark', isDarkMode);
+  }, [isDarkMode]);
 
+  // Persist persona and sessionId; reset chat on persona change
+  useEffect(() => {
+    localStorage.setItem('selectedPersona', selectedPersona);
+    if (!sessionId) {
+      const newSessionId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : `sess-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+      setSessionId(newSessionId);
+      localStorage.setItem('sessionId', newSessionId);
+    }
+    // Reset chat history when persona changes (matches your backend fix)
+    setMessages([]);
+    setWelcomeTyping('');
+  }, [selectedPersona]); // sessionId intentionally left out
+
+  // Welcome typing animation (runs when chat empty)
   useEffect(() => {
     if (messages.length === 0 && welcomeTyping === '') {
-      const welcomeMessage = "Hey there! I'm Nova, your witty AI sidekick built by Sanu Sharma. What's sparking your curiosity today? Drop a question or snap an image to dive in!";
-      let index = 0;
+      if (welcomeIntervalRef.current) clearInterval(welcomeIntervalRef.current);
+      const welcomeMessage = welcomeMessages[selectedPersona] || welcomeMessages.nova_default;
+      let idx = 0;
+      setWelcomeTyping(''); // ensure empty
       welcomeIntervalRef.current = setInterval(() => {
-        if (index < welcomeMessage.length) {
-          setWelcomeTyping(prev => prev + welcomeMessage.charAt(index));
-          index++;
+        if (idx < welcomeMessage.length) {
+          setWelcomeTyping(prev => prev + welcomeMessage.charAt(idx));
+          idx++;
         } else {
           clearInterval(welcomeIntervalRef.current);
         }
-      }, 40); // Typing speed for welcome
+      }, 30);
       return () => clearInterval(welcomeIntervalRef.current);
     }
-  }, [messages.length, welcomeTyping]);
-
-  // Blinking cursor effect
-  useEffect(() => {
-    if (loading || typingResponse) {
-      cursorIntervalRef.current = setInterval(() => {
-        setShowCursor(prev => !prev);
-      }, 500); // Blink every 500ms
-    } else {
-      setShowCursor(false);
-    }
-    return () => {
-      if (cursorIntervalRef.current) {
-        clearInterval(cursorIntervalRef.current);
-      }
-    };
-  }, [loading, typingResponse]);
-
-  const startTyping = useCallback(() => {
-    if (typingTimeoutRef.current) return;
-
-    const typeNext = () => {
-      if (typingBufferRef.current === '') {
-        if (typingTimeoutRef.current) {
-          clearTimeout(typingTimeoutRef.current);
-          typingTimeoutRef.current = null;
-        }
-        return;
-      }
-      const nextChar = typingBufferRef.current.charAt(0);
-      setTypingResponse(prev => prev + nextChar);
-      typingBufferRef.current = typingBufferRef.current.slice(1);
-
-      let delay = 50; // Base delay
-      if (nextChar === ' ' || /[,.;!?]/.test(nextChar)) {
-        delay = 100; // Pause after punctuation/spaces
-      } else if (/[a-zA-Z]/.test(nextChar)) {
-        delay = 40; // Faster for letters
-      }
-
-      typingTimeoutRef.current = setTimeout(typeNext, delay);
-    };
-
-    typeNext();
-  }, []);
-
-  const clearTyping = useCallback(() => {
-    if (typingTimeoutRef.current) {
-      clearTimeout(typingTimeoutRef.current);
-      typingTimeoutRef.current = null;
-    }
-    if (cursorIntervalRef.current) {
-      clearInterval(cursorIntervalRef.current);
-      cursorIntervalRef.current = null;
-    }
-    typingBufferRef.current = '';
-    setTypingResponse('');
-    setShowCursor(false);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages.length, selectedPersona]); // stable deps (welcomeMessages is top-level)
 
   const handleImageUpload = (e) => {
     const file = e.target.files[0];
@@ -117,265 +104,342 @@ function App() {
     }
   };
 
-  const flushAndClearTyping = useCallback(() => {
-    // Flush remaining buffer instantly into typingResponse
-    if (typingBufferRef.current) {
-      setTypingResponse(prev => prev + typingBufferRef.current);
-      typingBufferRef.current = '';
-    }
-    // Clear timeout if running
-    if (typingTimeoutRef.current) {
-      clearTimeout(typingTimeoutRef.current);
-      typingTimeoutRef.current = null;
-    }
-    setTypingResponse(''); // Hide placeholder after flush
-    setShowCursor(false);
-  }, []);
+  // Upload image first, get URL, then include in message
+  const uploadImage = useCallback(async (file) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await fetch(`${backendUrl}/api/upload/image?persona=${selectedPersona}`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!response.ok) throw new Error('Upload failed');
+    return response.json();
+  }, [backendUrl, selectedPersona]);
 
-  const sendMessage = () => {
-    if (!input.trim() && !imagePreview) return;
+  // Robust SSE parser that handles partial chunks and events
+  const parseSSEStream = async (reader, onToken, onEnd, onError) => {
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
 
-    // Reset typing states before new request
-    clearTyping();
-    setLoading(true);
-
-    if (imagePreview) {
-      // For images, use POST endpoint with fetch and manual SSE parsing
-      const userContent = input.trim() || "Describe this image.";
-      let payloadContent = [
-        { type: "text", text: userContent },
-        { type: "image_url", image_url: { url: imagePreview } }
-      ];
-
-      setMessages(prev => [...prev, { role: 'user', content: userContent, image: imagePreview }]);
-      setInput('');
-
-      fetch(`${backendUrl}/api/chat/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: sessionId,
-          messages: [{ role: "user", content: payloadContent }]
-        })
-      })
-        .then(response => {
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+        // process complete event blocks separated by \n\n
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+          const rawEvent = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          // handle event block
+          const lines = rawEvent.split(/\r?\n/);
+          let eventType = 'message';
+          let dataLines = [];
+          for (const line of lines) {
+            if (line.startsWith('event:')) {
+              eventType = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              dataLines.push(line.slice(5)); // keep leading spaces intentionally
+            }
           }
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let finalText = '';
-
-          function parseEvent(eventStr) {
-            const lines = eventStr.split('\n');
-            let eventType = 'message';
-            let data = '';
-            for (let line of lines) {
-              if (line.startsWith('event: ')) {
-                eventType = line.slice(7).trim();
-              } else if (line.startsWith('data: ')) {
-                data += line.slice(6);
+          const data = dataLines.join('\n').trim();
+          if (!data) {
+            // empty data - ignore
+            continue;
+          }
+          if (eventType === 'error') {
+            onError(data);
+            return;
+          } else if (eventType === 'end') {
+            // End event contains JSON metadata usually; try parse
+            let meta = null;
+            try { meta = JSON.parse(data); } catch (_e) { meta = data; }
+            onEnd(meta);
+            return;
+          } else {
+            // default: token / chunk
+            // try parse JSON if data looks like JSON, else treat as raw token
+            let token = data;
+            const trimmed = data.trim();
+            if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+              try {
+                const parsed = JSON.parse(trimmed);
+                // prefer parsed.content, else stringified parsed value
+                token = (parsed && (parsed.content || parsed.token || parsed.text || parsed.data)) || JSON.stringify(parsed);
+              } catch (_e) {
+                token = data;
               }
             }
-            // Remove newlines but preserve spaces
-            data = data.replace(/\n/g, '');
-            if (!data) return false;
-
-            if (eventType === 'end') {
-              try {
-                const endData = JSON.parse(data);
-                const usedModel = endData.model;
-                const usedModelNote = usedModel ? ` (via ${usedModel})` : '';
-                flushAndClearTyping();
-                setMessages(prev => [...prev, { role: 'assistant', content: finalText + usedModelNote }]);
-              } catch (e) {
-                flushAndClearTyping();
-                setMessages(prev => [...prev, { role: 'assistant', content: finalText }]);
-              }
-              setLoading(false);
-              setImage(null);
-              setImagePreview(null);
-              reader.cancel();
-              return true; // End of stream
-            } else if (eventType === 'error') {
-              clearTyping();
-              try {
-                const errData = JSON.parse(data);
-                setTypingResponse(`Error: ${errData.error}`);
-              } catch (e) {
-                setTypingResponse(`Error: ${data}`);
-              }
-              setLoading(false);
-              setImage(null);
-              setImagePreview(null);
-              reader.cancel();
-              return true;
-            } else {
-              // Default message data (tokens)
-              finalText += data;
-              typingBufferRef.current += data;
-              startTyping();
-            }
-            return false;
+            onToken(token);
           }
-
-          let buffer = '';
-
-          function read() {
-            reader.read().then(({ done, value }) => {
-              if (done) {
-                if (typingBufferRef.current) {
-                  // Flush any remaining on end of stream
-                  flushAndClearTyping();
-                }
-                return;
-              }
-              buffer += decoder.decode(value, { stream: true });
-              let boundary;
-              while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-                const event = buffer.slice(0, boundary);
-                buffer = buffer.slice(boundary + 2);
-                if (parseEvent(event)) {
-                  return; // Stream ended
-                }
-              }
-              read();
-            }).catch(err => {
-              console.error('Stream error:', err);
-              clearTyping();
-              setTypingResponse("⚠️ Connection lost.");
-              setLoading(false);
-              setImage(null);
-              setImagePreview(null);
-            });
+        }
+      }
+      // flush remaining buffer (if any)
+      if (buffer.trim()) {
+        // treat remainder as token
+        let token = buffer;
+        const trimmed = token.trim();
+        if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            token = (parsed && (parsed.content || parsed.token || parsed.text || parsed.data)) || JSON.stringify(parsed);
+          } catch (_e) {
+            token = buffer;
           }
-          read();
-        })
-        .catch(err => {
-          console.error('Fetch error:', err);
-          clearTyping();
-          setTypingResponse(`Error: ${err.message}`);
-          setLoading(false);
-          setImage(null);
-          setImagePreview(null);
-        });
-    } else {
-      // For text-only, use GET EventSource
-      const userContent = input.trim();
-      const url = new URL(`${backendUrl}/api/chat/stream`);
-      url.searchParams.set("session_id", sessionId);
-      url.searchParams.set("message", userContent);
-
-      setMessages(prev => [...prev, { role: 'user', content: userContent }]);
-      setInput('');
-
-      const es = new EventSource(url.toString());
-
-      let finalText = '';
-
-      es.onmessage = (e) => {
-        // Remove newlines but preserve spaces; no trim
-        const data = e.data.replace(/\n/g, '');
-        if (data) {
-          finalText += data;
-          typingBufferRef.current += data;
-          startTyping();
         }
-      };
-
-      es.addEventListener("end", (e) => {
-        // For end event, data is JSON, remove \n if any
-        const endDataStr = e.data.replace(/\n/g, '');
-        flushAndClearTyping();
-        try {
-          const endData = JSON.parse(endDataStr);
-          const usedModel = endData.model;
-          const usedModelNote = usedModel ? ` (via ${usedModel})` : '';
-          setMessages(prev => [...prev, { role: 'assistant', content: finalText + usedModelNote }]);
-        } catch {
-          setMessages(prev => [...prev, { role: 'assistant', content: finalText }]);
-        }
-        setLoading(false);
-        es.close();
-      });
-
-      es.addEventListener("error", (err) => {
-        console.error('EventSource failed:', err);
-        clearTyping();
-        setTypingResponse("⚠️ Connection lost.");
-        setLoading(false);
-        es.close();
-      });
-
-      // Cleanup on unmount or close
-      return () => {
-        es.close();
-      };
+        onToken(token);
+      }
+      // if stream ends without explicit end, call onEnd with null meta
+      onEnd(null);
+    } catch (err) {
+      onError(err.message || String(err));
     }
   };
 
-  const toggleDarkMode = () => {
-    setIsDarkMode(prev => !prev);
+  // sendMessage with streaming SSE
+  const sendMessage = async () => {
+    if (!input.trim() && !image) return;
+    setLoading(true);
+    const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    let userContent = input.trim();
+    let imageUrl = null;
+
+    // Handle image upload if present
+    if (image) {
+      try {
+        const uploadData = await uploadImage(image);
+        imageUrl = `${backendUrl}${uploadData.image_path || uploadData.path || uploadData.url}`;
+        userContent = userContent || "Sent an image.";
+      } catch (err) {
+        console.error('Upload error:', err);
+        setLoading(false);
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `Image upload failed: ${err.message || err}.`,
+          timestamp,
+          persona: selectedPersona
+        }]);
+        return;
+      }
+    }
+
+    // Prepare user message as backend expects (array with vision if image)
+    const newUserMessage = { role: 'user', content: userContent };
+    if (imageUrl) {
+      newUserMessage.content = [
+        { type: "text", text: userContent },
+        { type: "image_url", image_url: { url: imageUrl } }
+      ];
+    }
+
+    // Add user message visually
+    setMessages(prev => [...prev, { role: 'user', content: userContent, timestamp, image: imagePreview }]);
+    setInput('');
+    setImage(null);
+    setImagePreview(null);
+
+    // Insert assistant placeholder (typing)
+    assistantIndexRef.current = null;
+    setMessages(prev => {
+      const idx = prev.length;
+      assistantIndexRef.current = idx;
+      return [...prev, { role: 'assistant', content: '', isTyping: true, timestamp, persona: selectedPersona }];
+    });
+
+    try {
+      const response = await fetch(`${backendUrl}/api/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [newUserMessage],
+          session_id: sessionId,
+          persona: selectedPersona
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+
+      let fullResponse = '';
+
+      // token callback
+      const onToken = (token) => {
+        // tokens coming in may miss leading spaces; backend should flush sensible chunks,
+        // but we don't force additional spaces — we append raw token to preserve punctuation.
+        fullResponse += token;
+
+        // update assistant placeholder content live
+        setMessages(prev => {
+          // defensive: if assistantIndexRef not set, append new assistant node
+          let idx = assistantIndexRef.current;
+          if (idx === null || idx === undefined || idx >= prev.length) {
+            idx = prev.length;
+            assistantIndexRef.current = idx;
+            return [...prev, { role: 'assistant', content: fullResponse + (fullResponse.length < 80 ? '|' : ''), isTyping: true, timestamp, persona: selectedPersona }];
+          } else {
+            const newMsgs = [...prev];
+            newMsgs[idx] = {
+              ...newMsgs[idx],
+              content: fullResponse + (fullResponse.length < 80 ? '|' : ''), // short cursor effect
+              isTyping: true
+            };
+            return newMsgs;
+          }
+        });
+      };
+
+      const onEnd = (meta) => {
+        // finalize assistant message
+        setMessages(prev => {
+          const newMsgs = [...prev];
+          let idx = assistantIndexRef.current;
+          if (idx === null || idx === undefined || idx >= newMsgs.length) {
+            // fallback, push new assistant message
+            newMsgs.push({
+              role: 'assistant',
+              content: fullResponse,
+              isTyping: false,
+              hasMemory: true,
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              persona: selectedPersona
+            });
+          } else {
+            newMsgs[idx] = {
+              ...newMsgs[idx],
+              content: fullResponse,
+              isTyping: false,
+              hasMemory: true,
+              persona: selectedPersona,
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            };
+          }
+          return newMsgs;
+        });
+        setLoading(false);
+      };
+
+      const onError = (errMsg) => {
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: `Error: ${errMsg}`,
+          isTyping: false,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          persona: selectedPersona
+        }]);
+        setLoading(false);
+      };
+
+      await parseSSEStream(reader, onToken, onEnd, onError);
+
+    } catch (err) {
+      console.error('Stream error:', err);
+      setMessages(prev => {
+        const newMsgs = [...prev];
+        const idx = assistantIndexRef.current;
+        const fallback = {
+          role: 'assistant',
+          content: `Error: ${err.message || err}. Try again!`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          persona: selectedPersona
+        };
+        if (idx !== null && idx !== undefined && idx < newMsgs.length) {
+          newMsgs[idx] = { ...newMsgs[idx], ...fallback, isTyping: false };
+        } else {
+          newMsgs.push(fallback);
+        }
+        return newMsgs;
+      });
+      setLoading(false);
+    }
+  };
+
+  const toggleDarkMode = () => setIsDarkMode(prev => !prev);
+
+  // Use onKeyDown to capture Enter (and avoid deprecated onKeyPress)
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (!loading) sendMessage();
+    }
   };
 
   return (
     <div className={`app ${isDarkMode ? 'dark' : ''}`}>
       <header className="header">
         <div className="header-content">
-          <div className="header-avatar">N</div>
-          <h1 className="header-title">Nova AI Chat</h1>
+          <div className="header-avatar">{currentAvatar}</div>
+          <div className="header-text">
+            <h1 className="header-title">Nova AI Chat</h1>
+          </div>
+          <div className="persona-switch-wrapper">
+            <label htmlFor="persona-select" className="switch-label sr-only">Switch Persona</label>
+            <select
+              id="persona-select"
+              value={selectedPersona}
+              onChange={(e) => setSelectedPersona(e.target.value)}
+              className="persona-select"
+            >
+              {PERSONAS.map(persona => (
+                <option key={persona.key} value={persona.key}>{persona.label}</option>
+              ))}
+            </select>
+          </div>
           <div className="header-status">Online</div>
-          <button onClick={toggleDarkMode} className="dark-toggle" title={isDarkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}>
+          <button className="dark-toggle" onClick={toggleDarkMode} aria-label="Toggle dark mode">
             {isDarkMode ? '☀️' : '🌙'}
           </button>
         </div>
       </header>
+
       <main className="main">
         <div className="chat-messages">
           {messages.length === 0 && welcomeTyping !== '' && (
-            <div className="welcome-message">
-              <div className="welcome-avatar">N</div>
-              <div className="welcome-content">
-                <p className="welcome-text" dangerouslySetInnerHTML={{ __html: welcomeTyping.replace(/\n/g, '<br/>') }} />
+            <div className="message-wrapper assistant">
+              <div className="message assistant">
+                <div className="avatar assistant">{currentAvatar}</div>
+                <div className="message-content">
+                  <p className="welcome-text" dangerouslySetInnerHTML={{ __html: welcomeTyping.replace(/\n/g, '<br/>') }} />
+                </div>
               </div>
             </div>
           )}
+
           {messages.map((msg, i) => (
-            <div key={i} className={`message-wrapper ${msg.role} slide-in-${msg.role}`}>
+            <div key={i} className={`message-wrapper ${msg.role}`}>
               <div className={`message ${msg.role}`}>
-                <div className={`avatar ${msg.role}`}>{msg.role === 'user' ? 'U' : 'N'}</div>
+                <div className={`avatar ${msg.role}`}>{msg.role === 'user' ? 'U' : currentAvatar}</div>
                 <div className="message-content">
                   {msg.image && <img src={msg.image} alt="Uploaded" className="uploaded-image" />}
-                  <p dangerouslySetInnerHTML={{ __html: typeof msg.content === 'string' ? msg.content.replace(/\n/g, '<br/>') : 'Image query' }} />
+                  <p dangerouslySetInnerHTML={{ __html: msg.isTyping ? (msg.content || '') : (msg.content || '').replace(/\n/g, '<br/>') }} />
+                  {msg.hasMemory && !msg.isTyping && <span className="memory-icon">🧠</span>}
+                  {!msg.isTyping && <div className="message-time">{msg.timestamp}</div>}
                 </div>
               </div>
             </div>
           ))}
-          {(loading || typingResponse) && (
-            <div className="message-wrapper assistant slide-in-assistant">
+
+          {loading && (
+            <div className="message-wrapper assistant">
               <div className="message assistant">
-                <div className="avatar assistant">N</div>
-                <div className="message-content typing-message">
-                  {loading && !typingResponse && (
-                    <div className="typing-indicator">
-                      <span className="dot"></span>
-                      <span className="dot"></span>
-                      <span className="dot"></span>
-                    </div>
-                  )}
-                  {typingResponse && (
-                    <>
-                      <p className="typing-text" dangerouslySetInnerHTML={{ __html: typingResponse.replace(/\n/g, '<br/>') }} />
-                      {showCursor && <span className="blinking-cursor">|</span>}
-                    </>
-                  )}
+                <div className="avatar assistant">{currentAvatar}</div>
+                <div className="message-content typing-indicator">
+                  <div className="typing-dots">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                  </div>
                 </div>
               </div>
             </div>
           )}
+
           <div ref={messagesEndRef} />
         </div>
       </main>
+
       <div className="input-area">
         <div className="input-wrapper">
           <label className="file-input">
@@ -386,17 +450,18 @@ function App() {
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyPress={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), sendMessage())}
-            placeholder="Type your message... (Shift+Enter for new line)"
-            disabled={loading || typingResponse}
+            onKeyDown={handleKeyDown}
+            placeholder="Type your message..."
+            disabled={loading}
             className="input-field"
             rows={1}
           />
-          <button onClick={sendMessage} disabled={loading || typingResponse || (!input.trim() && !image)} className="send-btn">
+          <button onClick={sendMessage} disabled={loading || (!input.trim() && !image)} className="send-btn">
             <span className="send-icon">→</span>
           </button>
         </div>
       </div>
+
       <footer className="footer">
         <p>Built with ❤️ by <strong>Sanu Sharma</strong></p>
       </footer>
